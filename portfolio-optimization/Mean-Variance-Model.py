@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 import numpy as np
 import pandas as pd
+from sklearn.covariance import LedoitWolf
 import os
 from scipy.optimize import minimize
 
@@ -17,47 +18,164 @@ else:
     df = pd.read_csv(file_path, header=[0,1], index_col=0)
 
 returns = df.pct_change().dropna()
-mean_returns = returns.mean()*252
-cov_matrix = returns.cov()*252
-n_assets = len(tickers)
 
-def portfolio_variance(weights):
-    return np.dot(weights.T, np.dot(cov_matrix, weights))
+raw_annual_returns = returns.mean()* 252
+universe_mean = raw_annual_returns.mean()
 
-target_return=0.05
-step = 0.01
+shrinkage_weight = 0.30
+mean_returns = (shrinkage_weight*raw_annual_returns)+(1-shrinkage_weight)*universe_mean
 
-def minimise(target_return):
-    constraints = (
-        #total return = R(target return)
-        {'type':'eq','fun':lambda w: np.dot(w, mean_returns) - target_return},
+lw=LedoitWolf()
+cov_matrix = lw.fit(returns).covariance_*252
+
+def risky_minimise(mu, sigma, w_old, risk_aversion=2.0, cost_pct=0.005):
+    N=len(mu)
+
+    def objective(x):
+        w= x[:N]
+        u= x[N : 2*N]
+        v= x[2*N :]
+
+        portfolio_return = np.dot(w, mu)
+        portfolio_variance = np.dot(w.T, np.dot(sigma, w))
+        total_costs = np.sum(cost_pct * (u+v))
+
+        utility = portfolio_return - (0.5*portfolio_variance*risk_aversion) - total_costs
+        return -utility
+
+    init_guess = np.concatenate([w_old, np.zeros(N), np.zeros(N)])
+
+    constraints = [
         #total capital allocation = 1
-        {'type': 'eq','fun':lambda w: np.sum(w)-1.0}
-    )
+        {'type': 'eq','fun':lambda x: np.sum(x[:N])-1.0}
+    ]
+
+    for i in range(N):
+            constraints.append({
+                'type':'eq',
+                'fun' : lambda x, index=i: x[index] - w_old[index] - (x[N+index] - x[2*N+index])
+            })
 
     #no short selling. i.e 0<=wi<=1
-    bounds = tuple((0,1) for _ in range(n_assets))
+    bounds = [(0,1)]*(3*N)
 
-    init_guess = np.repeat(1/ n_assets, n_assets)
-
-    result = minimize(portfolio_variance, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+    result = minimize(objective, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
 
     return result
 
-returns = []
-volatility = []
-last = 0
-opt_return=target_return #set default >0 will change after first loop anyway
-while (opt_return>=last and target_return<=0.35):
-    result = minimise(target_return)
-    opt_weights = result.x
-    opt_return = np.dot(opt_weights, mean_returns)
-    opt_volatility = np.sqrt(result.fun)
-    returns.append(opt_return)
-    volatility.append(opt_volatility)
-    last=opt_return
-    target_return+=step
+#calculate optimal portfolio given access to a risk free asset
+def rf_minimise(mu, sigma, w_old, rf, risk_aversion=2.0, cost_pct=0.005):
+    
+    N = len(mu)
+    def objective(x):
+        #0-(n-1)th items are risky assets
+        w= x[:N]
+        #n-th item is the risk free asset
+        w_rf= x[N]
+    
+        u= x[N+1 : 2*N+1]
+        v= x[2*N+1 :]
 
-plt.plot(volatility, returns)
+        #sum of portfolios expected return
+        portfolio_return = np.dot(w, mu) + w_rf * rf
+        #compute total portfolio risk, by calculating each assets marginal contribution
+        portfolio_variance = np.dot(w.T, np.dot(sigma, w))
+        #total cost of transaction fees
+        total_costs = np.sum(cost_pct * (u+v))
 
+        #function we want to minimise (or maximise really). expected return - risk - transaction fees
+        utility = portfolio_return - (0.5*risk_aversion * portfolio_variance) - total_costs
+        return -utility
+
+    #initial weights is previous weights plus 0 changes
+    init_guess = np.concatenate([w_old, [1.0-np.sum(w_old)], np.zeros(N), np.zeros(N)])
+
+    #we must have all capital invested at a given time
+    constraints = [
+        {'type':'eq','fun':lambda x: np.sum(x[:N+1])-1.0}
+    ]
+
+    for i in range(N):
+        constraints.append({
+            'type':'eq',
+            'fun' : lambda x, index=i: x[index] - w_old[index] - (x[N+1+index] - x[2*N+1+index])
+        })
+
+    #0<=wi<=1. i.e no short selling
+    bounds = [(0,1)]*(3*N+1)
+
+    #our minimized portfolio
+    result = minimize(objective, init_guess, method="SLSQP", bounds=bounds, constraints=constraints)
+
+    if not result.success:
+        raise ValueError(f"Optimisation failed:  {result.message}")
+
+    return result
+    # #weights of risky assets
+    # optimised_risky_weights = result.x[:N]
+    # #weight of risk free asset
+    # optimised_rf_weight = result.x[N]
+
+    # return (optimised_risky_weights, optimised_rf_weight)
+
+
+rf_rate = 0.08
+# (wr,wrf) = minimise_with_costs(mean_returns, cov_matrix, np.zeros(len(tickers)), rf_rate)
+# result = minimise_with_costs(mean_returns, cov_matrix, np.zeros(len(tickers)), rf_rate)
+
+N = len(tickers)
+# print("Optimized Risky Weights:", np.round(result.x[:N], 4))
+# print("Optimized Risk-Free Weight:", round(result.x[N], 4))
+# print("optimized Expected Returns:", np.dot(mean_returns, result.x[:N]) + rf_rate*result.x[N])
+
+rf_return_vec=[]
+rf_risk_vec=[]
+
+risky_return_vec=[]
+risky_risk_vec=[]
+
+current_guess = np.zeros(len(tickers))
+
+lambdas = np.logspace(np.log10(0.01), np.log10(500), num=50)
+for l in lambdas:
+    result = rf_minimise(mean_returns, cov_matrix, risk_aversion=l, w_old=current_guess, rf=rf_rate)
+    if result.success:
+        current_guess=result.x[:N]
+    rf_return_vec.append(np.dot(mean_returns, result.x[:N])+result.x[N]*rf_rate)
+    rf_risk_vec.append(np.sqrt(np.dot(result.x[:N], np.dot(cov_matrix, result.x[:N]))))
+
+current_guess = [1/len(tickers)]*len(tickers)
+
+for l in lambdas:
+    result = risky_minimise(mean_returns, cov_matrix, risk_aversion=l, w_old=current_guess)
+    if result.success:
+        current_guess=result.x[:N]
+    risky_return_vec.append(np.dot(mean_returns, result.x[:N])+result.x[N]*rf_rate)
+    risky_risk_vec.append(np.sqrt(np.dot(result.x[:N], np.dot(cov_matrix, result.x[:N]))))
+
+# prep data
+risks_rf = np.array(rf_risk_vec)
+returns_rf = np.array(rf_return_vec)
+
+risks_risky = np.array(risky_risk_vec)
+returns_risky = np.array(risky_return_vec)
+
+idx_rf = np.argsort(risks_rf)
+risks_rf, returns_rf = risks_rf[idx_rf], returns_rf[idx_rf]
+
+idx_risky = np.argsort(risks_risky)
+risks_risky, returns_risky = risks_risky[idx_risky], returns_risky[idx_risky]
+
+
+#plot graphs
+plt.figure(figsize=(8,5))
+plt.plot(risks_rf, returns_rf, label = "risk-free asset available")
+plt.plot(risks_risky, returns_risky, label = "only risky assets")
+
+plt.xlabel('portfolio Risk (Volatility)')
+plt.ylabel("Expected Returns")
+plt.legend()
+plt.grid(True)
 plt.show()
+
+
