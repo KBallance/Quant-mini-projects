@@ -193,7 +193,7 @@ risk_free_rate=0.04
 
 def calc_help_sim(df):
     returns = df.pct_change().dropna()
-
+    print(returns)
     raw_annual_returns = returns.mean()* 252
     universe_mean = raw_annual_returns.mean()
 
@@ -214,10 +214,8 @@ def simulate_year(risky, risk_free, rfr, start_year):
         change_vec.append(np.dot(risky, c))
 
     return change_vec
-    
 
-    return change_vec
-        
+#fetch data for stocks in list that exist for 2 years. dont compare agaisnt what next year holdings look like as that add a dimension of bias        
 def fetch_data(year):
     if not os.path.exists(f"{historical_data_path}{year}.csv"):
         #attempt to download historical data using index holdings
@@ -226,31 +224,30 @@ def fetch_data(year):
         df=yf.download(
             tickers=tickers, 
             start=f"{year}-01-01", 
-            end=f"{year+1}-01-01", 
+            end=f"{year+2}-01-01", 
             auto_adjust=True,
             progress=False
         )
-    
-        if isinstance(df.columns, pd.MultiIndex):
-            df = df["Close"].copy()
-        else:
-             df=df.copy()
-    
-        df = df.dropna(how="all", axis=1)
-        df = df.dropna(how="all", axis=0)
-    
-        df.to_csv(f"{historical_data_path}{year}.csv")
+        df = df[:252]
+        adj_close = df.get("Adj Close", pd.DataFrame(index=df.index))
+        close = df.get("Close", pd.DataFrame(index=df.index))
+        prices = adj_close.combine_first(close)
+        prices = prices.replace(['NaN', 'nan', 'None'], np.nan)
+        prices.dropna(axis=1, how='all', inplace=True)
+        prices.to_csv(f"{historical_data_path}{year}.csv")
+        return prices
     else:
-        df=pd.read_csv(f"{historical_data_path}{year}.csv", header=[0,1], index_col=0)
+        df = pd.read_csv(f"{historical_data_path}{year}.csv")
+        return df
 
-    return df
 
 rw, riskw = [], []
 
 for i in range(1):
     year = 2000+i
     df=fetch_data(year)
-  
+
+    print(df)
 
     mu, sigma = calc_help_sim(df)
 
