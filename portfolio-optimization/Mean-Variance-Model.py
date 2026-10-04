@@ -193,29 +193,43 @@ risk_free_rate=0.04
 
 def calc_help_sim(df):
     returns = df.pct_change().dropna()
-    print(returns)
-    raw_annual_returns = returns.mean()* 252
+    trading_days = (len(returns)+1)
+
+    raw_annual_returns = returns.mean()*(trading_days)
     universe_mean = raw_annual_returns.mean()
 
     shrinkage_weight = 0.30
     mean_returns = (shrinkage_weight*raw_annual_returns)+(1-shrinkage_weight)*universe_mean
 
     lw=LedoitWolf()
-    cov_matrix = lw.fit(returns).covariance_*252
+    cov_matrix = lw.fit(returns).covariance_*(trading_days)
 
     return mean_returns, cov_matrix
 
-def simulate_year(risky, risk_free, rfr, start_year):
-    df=fetch_data(start_year)
-    daily_change = df.pct_change()
-    change_vec=[]
-    for c in daily_change:
-        #ignore risk free for now
-        change_vec.append(np.dot(risky, c))
+def simulate_year(risky, risk_free, rfr, data):
+    daily_change = data.pct_change()
+    total_rf_gain = risk_free*rfr #total gains from capital allocated to risk free assets. not compounding.
+    daily_linear_rfr_gain = total_rf_gain/(len(data))
+    change_vec = np.dot(daily_change, risky)
+    change_vec = change_vec[~np.isnan(change_vec)]
+    accum = [sum(risky)] #percentage of starting capital allocated to risky assets
+    #calculate accumulated alpha daily
+    for c in change_vec:
+        last = accum.pop()
+        next = last*(1+c)
+        accum.extend([last,next])
 
-    return change_vec
+    #adds risk free gains as linear change that unnafects daily changes through risky investments as in practice only get gains yearly when investment matures.
+    rf_accum = [risk_free]
+    total_accum = accum.copy()
+    total_accum[0]+=risk_free
+    for i in range(len(change_vec)):
+        rf_accum.append(risk_free+daily_linear_rfr_gain*i)
+        total_accum[i+1]+=(risk_free+daily_linear_rfr_gain*i)
+    
+    return change_vec, total_accum, accum, rf_accum
 
-#fetch data for stocks in list that exist for 2 years. dont compare agaisnt what next year holdings look like as that add a dimension of bias        
+#fetch data for stocks for which data exists for 2 years (from desired start). dont compare agaisnt what next years (SYP) holdings looks like as that garantees at least partial success of the asset     
 def fetch_data(year):
     if not os.path.exists(f"{historical_data_path}{year}.csv"):
         #attempt to download historical data using index holdings
@@ -225,40 +239,65 @@ def fetch_data(year):
             tickers=tickers, 
             start=f"{year}-01-01", 
             end=f"{year+2}-01-01", 
-            auto_adjust=True,
             progress=False
         )
-        df = df[:252]
         adj_close = df.get("Adj Close", pd.DataFrame(index=df.index))
         close = df.get("Close", pd.DataFrame(index=df.index))
         prices = adj_close.combine_first(close)
         prices = prices.replace(['NaN', 'nan', 'None'], np.nan)
-        prices.dropna(axis=1, how='all', inplace=True)
+        prices.dropna(axis=1, how='any', inplace=True)
         prices.to_csv(f"{historical_data_path}{year}.csv")
         return prices
     else:
-        df = pd.read_csv(f"{historical_data_path}{year}.csv")
+        df = pd.read_csv(f"{historical_data_path}{year}.csv", index_col=0, parse_dates=True)
         return df
 
 
 rw, riskw = [], []
+eps = 1e-7
+
+spy = yf.download(tickers=["SPY"], 
+            start=f"2001-01-01", 
+            end=f"2002-01-01",
+            progress=False)
+
 
 for i in range(1):
     year = 2000+i
     df=fetch_data(year)
 
-    print(df)
-
-    mu, sigma = calc_help_sim(df)
-
+    mu, sigma = calc_help_sim(df[:252]) #take first half of data 
+    
     if rw==[]:
         rw = [0]*len(df.columns)
 
-    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=5.0)
-    print(rw)
-    print(rfw)
-    print(sum(rw) + rfw)
+    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=30.0)
+
+    rw[np.abs(rw)<eps] = 0 #modifies entries in place to zero if their value is less than 0.0000001
+
+    change, accumulated, risky_only, rf_only = simulate_year(rw, rfw,risk_free_rate, df[252:]) #use second half of dataset for simulation
+
+    spy_pct = spy.get("Close", pd.DataFrame(index=spy.index)).pct_change().to_numpy()
+    spy_pct = spy_pct[~np.isnan(spy_pct)]
+    spy_accum = [1]
+
+    for c in spy_pct:
+        last = spy_accum.pop()
+        next = last*(1+c)
+        spy_accum.extend([last,next])
+
+    print(f"risk free weight: {rfw}")
+    print(f"risky weights: {rw}")
     
-    print(sorted(rw))
-    data = simulate_year(rw, rfw,risk_free_rate, 2001+i)
+    plt.figure(figsize=(14,10))
+    plt.plot(accumulated, label="optimised portfolio returns")
+    plt.plot(risky_only, label="risky assets returns")
+    plt.plot(rf_only, label="risk free returns")
+    plt.plot(spy_accum, label="SPY returns")
+    plt.legend(bbox_to_anchor=(1.05,1), loc="upper left", borderaxespad=0.0)
+    plt.grid()
+    plt.tight_layout()
+    plt.ylabel("alpha")
+    plt.xlabel("days")
+    plt.show()
     
