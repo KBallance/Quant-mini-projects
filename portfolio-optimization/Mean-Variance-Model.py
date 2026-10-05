@@ -9,6 +9,7 @@ from scipy.optimize import minimize
 file_path = "portfolio-optimization/stock_data.csv"
 index_holding_path = "portfolio-optimization/SPY_holdings/"
 historical_data_path = "portfolio-optimization/stock_history/"
+test_weights = "portfolio-optimization/test_weights.csv"
 
 
 # tickers = ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "GOOG", "SPCX", "AVGO", "META", "TSLA", "MU", "AMD", "WMT", "ASML", "INTC", "CSCO", "PLTR", "COST", "LRCX", "AMAT", "NFLX", "PANW", "ARM", "SNDK", "TXN", "KLAC", "MRVL", "LIN", "AMGN", "LLY", "JPM", "V", "XOM", "JNJ", "ABBV", "ORCL", "CVX", "BAC", "KO", "CAT", "MRK"]
@@ -230,6 +231,19 @@ def simulate_year(risky, risk_free, rfr, data, start_c=1):
     
     return change_vec, total_accum, accum, rf_accum
 
+#TODO: use previous and next dataframes of stock data to align the previous weight vector with that of the next years dataframe. i.e. add/remove items that now/no longer exist and reorder to match next.
+#Note: use fact that weight vector and df are already sorted for last year.
+#question: how to deal with assets that we had capital in that dont exist in the next timeframe? enswer: I think just erase the weight from existence
+def transform_weights (last_weights, df_last : pd.DataFrame, df_new : pd.DataFrame):
+    weight_indexes = np.asarray(last_weights).ravel()
+    weight_last = pd.Series(weight_indexes, index=df_last.columns, name="weight")
+    active_weights = weight_last[weight_last != 0]
+    new_weights = pd.Series(0.0, index=df_new.columns, name="weight")
+    common_tickers = active_weights.index.intersection(df_new.columns)
+    new_weights.loc[common_tickers] = active_weights.loc[common_tickers]
+    #dropped entries dont need to be handled as optimisation will just treat it as a forced rebalance (for now at least)TODO fix this. need to somehow maintain weights. Suggestion: just add the missing assets to the universe if possible.
+    return new_weights.to_numpy()
+
 #fetch data for stocks for which data exists for 2 years (from desired start). dont compare agaisnt what next years (SYP) holdings looks like as that garantees at least partial success of the asset     
 def fetch_data(year):
     if not os.path.exists(f"{historical_data_path}{year}.csv"):
@@ -240,12 +254,11 @@ def fetch_data(year):
             tickers=tickers, 
             start=f"{year}-01-01", 
             end=f"{year+2}-01-01", 
-            progress=False
+            progress=False,
+            auto_adjust=True
         )
-        adj_close = df.get("Adj Close", pd.DataFrame(index=df.index))
-        close = df.get("Close", pd.DataFrame(index=df.index))
-        prices = adj_close.combine_first(close)
-        prices = prices.replace(['NaN', 'nan', 'None'], np.nan)
+        prices = df.get("Close", pd.DataFrame(index=df.index))
+        prices = prices.replace(['Nan', 'nan', 'None'], np.nan)
         prices.dropna(axis=1, how='any', inplace=True)
         prices.to_csv(f"{historical_data_path}{year}.csv")
         return prices
@@ -255,25 +268,36 @@ def fetch_data(year):
 
 
 rw, rw_last = [], []
-rf_last = 0
+rfw=0
+rfw_last = 0
 eps = 1e-7
 
 total = []
 risky = []
 risk_free = []
-years = 2
+years = 20
 
 spy = yf.download(tickers=["SPY"], 
             start=f"2001-01-01", 
-            end=f"200{years+1}-01-01",
-            progress=False)
+            end=f"{years+2001}-01-01",
+            progress=False,
+            auto_adjust=True)
+
+x = np.array([0,0,1,2,0,4])
 
 for i in range(years):
     progress_string= "*"*(i+1)+"-"*(years-(i+1))
     print(progress_string)
     year = 2000+i
     df=fetch_data(year)
+    if i>0:
+        df_last = fetch_data(year-1)
+        #takes weights generated from last rebalance and fits it to a vector compatible with nexy years assets.
+        rw = transform_weights(rw, df_last, df)
+    print(f"\n {rw}")
+    print(len(rw))
 
+    #prep sample data
     mu, sigma = calc_help_sim(df[:252]) #take first half of data 
     
     if len(rw)==0:
@@ -282,23 +306,26 @@ for i in range(years):
     rw_last = rw.copy()
     rfw_last = rfw
 
+    #optimise
     rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=30.0)
 
+    #clean
     rw[np.abs(rw)<eps] = 0 #modifies entries in place to zero if their value is less than 0.0000001
-
+    #calculate total loss due to transactions
     change = (sum(abs(rw_last - rw)) + abs(rfw_last-rfw))*cost_pct
-    print(change)
 
     try:
         start_c=total[-1]
     except:
         start_c=1
-
+    #remove costs from total capital
+    print(start_c)
     start_c -= change
     print(start_c)
-
+    #simulate for proceeding year
+    #could compute return as one value, but I want to graph it.
     change, accumulated, risky_only, rf_only = simulate_year(rw, rfw,risk_free_rate, df[252:], start_c) #use second half of dataset for simulation
-
+    #extend vectors for graphing
     total.extend(accumulated)
     risky.extend(risky_only)
     risk_free.extend(rf_only)
@@ -307,6 +334,7 @@ for i in range(years):
 spy_pct = spy.get("Close", pd.DataFrame(index=spy.index)).pct_change().to_numpy()
 spy_pct = spy_pct[~np.isnan(spy_pct)]
 spy_accum = [1]
+print(spy_pct)
 
 for c in spy_pct:
     next = spy_accum[-1]*(1+c)
@@ -315,10 +343,10 @@ for c in spy_pct:
 print(f"risk free weight: {rfw}")
 print(f"risky weights: {rw}")
     
-plt.figure(figsize=(14,10))
-plt.plot(accumulated, label="optimised portfolio returns")
-plt.plot(risky_only, label="risky assets returns")
-plt.plot(rf_only, label="risk free returns")
+plt.figure(figsize=(14,8))
+plt.plot(total, label="optimised portfolio returns")
+plt.plot(risky, label="risky assets returns")
+plt.plot(risk_free, label="risk free returns")
 plt.plot(spy_accum, label="SPY returns")
 plt.legend(bbox_to_anchor=(1.05,1), loc="upper left", borderaxespad=0.0)
 plt.grid()
