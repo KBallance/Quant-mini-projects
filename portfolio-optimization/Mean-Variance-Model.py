@@ -234,14 +234,29 @@ def simulate_year(risky, risk_free, rfr, data, start_c=1):
 #TODO: use previous and next dataframes of stock data to align the previous weight vector with that of the next years dataframe. i.e. add/remove items that now/no longer exist and reorder to match next.
 #Note: use fact that weight vector and df are already sorted for last year.
 #question: how to deal with assets that we had capital in that dont exist in the next timeframe? enswer: I think just erase the weight from existence
-def transform_weights (last_weights, df_last : pd.DataFrame, df_new : pd.DataFrame):
+def transform_weights (last_weights, df_last : pd.DataFrame, df_new : pd.DataFrame, year: int= None):
     weight_indexes = np.asarray(last_weights).ravel()
     weight_last = pd.Series(weight_indexes, index=df_last.columns, name="weight")
     active_weights = weight_last[weight_last != 0]
     new_weights = pd.Series(0.0, index=df_new.columns, name="weight")
     common_tickers = active_weights.index.intersection(df_new.columns)
     new_weights.loc[common_tickers] = active_weights.loc[common_tickers]
-    #dropped entries dont need to be handled as optimisation will just treat it as a forced rebalance (for now at least)TODO fix this. need to somehow maintain weights. Suggestion: just add the missing assets to the universe if possible.
+    not_common_tickers = active_weights.index.difference(df_new.columns).to_list()
+    if len(not_common_tickers) >0:
+        print(not_common_tickers)
+        new = yf.download(
+            tickers=not_common_tickers, 
+            start=f"{year}-01-01", 
+            end=f"{year+2}-01-01", 
+            progress=False,
+            auto_adjust=True
+        )
+        new = df.get("Close", pd.DataFrame(index=df.index))
+        new = new.replace(['Nan', 'nan', 'None'], np.nan)
+        new.dropna(axis=1, how='any', inplace=True)
+        df_new_upd = df_new.join(new)
+        df_new_upd.to_csv(f"{historical_data_path}{year}.csv")
+        return transform_weights(last_weights=last_weights, df_last=df_last, df_new=df_new_upd, year=year)
     return new_weights.to_numpy()
 
 #fetch data for stocks for which data exists for 2 years (from desired start). dont compare agaisnt what next years (SYP) holdings looks like as that garantees at least partial success of the asset     
@@ -293,7 +308,7 @@ for i in range(years):
     if i>0:
         df_last = fetch_data(year-1)
         #takes weights generated from last rebalance and fits it to a vector compatible with nexy years assets.
-        rw = transform_weights(rw, df_last, df)
+        rw = transform_weights(rw, df_last, df, year)
     print(f"\n {rw}")
     print(len(rw))
 
@@ -307,7 +322,7 @@ for i in range(years):
     rfw_last = rfw
 
     #optimise
-    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=30.0)
+    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=5.0)
 
     #clean
     rw[np.abs(rw)<eps] = 0 #modifies entries in place to zero if their value is less than 0.0000001
@@ -342,13 +357,34 @@ for c in spy_pct:
 
 print(f"risk free weight: {rfw}")
 print(f"risky weights: {rw}")
-    
-plt.figure(figsize=(14,8))
-plt.plot(total, label="optimised portfolio returns")
-plt.plot(risky, label="risky assets returns")
-plt.plot(risk_free, label="risk free returns")
-plt.plot(spy_accum, label="SPY returns")
-plt.legend(bbox_to_anchor=(1.05,1), loc="upper left", borderaxespad=0.0)
+
+fig = plt.figure(figsize=(14,8))
+tot_line, =plt.plot(total, label="optimised portfolio returns")
+risk_line, =plt.plot(risky, label="risky assets returns")
+rf_line, =plt.plot(risk_free, label="risk free returns")
+spy_line, =plt.plot(spy_accum, label="SPY returns")
+leg = plt.legend(bbox_to_anchor=(1.05,1), loc="upper left", borderaxespad=0.0, fancybox=True)
+
+lines = [tot_line, risk_line, rf_line, spy_line]
+lined = {}
+for legline, origline in zip(leg.get_lines(), lines):
+    legline.set_picker(True)  # Enable picking on the legend line.
+    lined[legline] = origline
+
+def on_pick(event):
+    # On the pick event, find the original line corresponding to the legend
+    # proxy line, and toggle its visibility.
+    legline = event.artist
+    origline = lined[legline]
+    visible = not origline.get_visible()
+    origline.set_visible(visible)
+    # Change the alpha on the line in the legend, so we can see what lines
+    # have been toggled.
+    legline.set_alpha(1.0 if visible else 0.2)
+    fig.canvas.draw()
+
+
+fig.canvas.mpl_connect('pick_event', on_pick)
 plt.grid()
 plt.tight_layout()
 plt.ylabel("alpha")
