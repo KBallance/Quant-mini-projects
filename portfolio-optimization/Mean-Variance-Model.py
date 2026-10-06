@@ -2,9 +2,11 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 import numpy as np
 import pandas as pd
+
 from sklearn.covariance import LedoitWolf
 import os
 from scipy.optimize import minimize
+import cvxpy as cp
 
 file_path = "portfolio-optimization/stock_data.csv"
 index_holding_path = "portfolio-optimization/SPY_holdings/"
@@ -74,58 +76,41 @@ def risky_minimise(mu, sigma, w_old, risk_aversion=2.0, cost_pct=0.005):
 cost_pct = 0.005
 
 #calculate optimal portfolio given access to a risk free asset
-def rf_minimise(mu, sigma, w_old, rf, risk_aversion=2.0, cost_pct=cost_pct):
+def rf_minimise(mu, sigma, w_old, rf, risk_aversion=2.0, cost_pct=cost_pct, max_weight=0.05):
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    w_old = np.asarray(w_old, dtype=np.float64)
     
     N = len(mu)
-    def objective(x):
-        #0-(n-1)th items are risky assets
-        w= x[:N]
-        #n-th item is the risk free asset
-        w_rf= x[N]
+
+    sigma = (sigma + sigma.T) / 2.0
     
-        u= x[N+1 : 2*N+1]
-        v= x[2*N+1 :]
+    w = cp.Variable(N, nonneg=True)
+    w_rf= cp.Variable(nonneg=True)
 
-        #sum of portfolios expected return
-        portfolio_return = np.dot(w, mu) + w_rf * rf
-        #compute total portfolio risk, by calculating each assets marginal contribution
-        portfolio_variance = np.dot(w.T, np.dot(sigma, w))
-        #total cost of transaction fees
-        total_costs = np.sum(cost_pct * (u+v))
+    #sum of portfolios expected return
+    portfolio_return = w @ mu + w_rf * rf
+    #compute total portfolio risk, by calculating each assets marginal contribution
+    portfolio_variance = cp.quad_form(w, cp.psd_wrap(sigma))
+    #total cost of transaction fees
+    total_costs = cost_pct * cp.sum(w - w_old)
 
-        #function we want to minimise (or maximise really). expected return - risk - transaction fees
-        utility = portfolio_return - (0.5*risk_aversion * portfolio_variance) - total_costs
-        return -utility
-
-    #initial weights is previous weights plus 0 changes
-    init_guess = np.concatenate([w_old, [1.0-np.sum(w_old)], np.zeros(N), np.zeros(N)])
+    
+    utility = portfolio_return - (0.5*risk_aversion * portfolio_variance) - total_costs
 
     #we must have all capital invested at a given time
     constraints = [
-        {'type':'eq','fun':lambda x: np.sum(x[:N+1])-1.0}
+        cp.sum(w) + w_rf <= 1.0,
+        w <= max_weight
     ]
 
-    for i in range(N):
-        constraints.append({
-            'type':'eq',
-            'fun' : lambda x, index=i: x[index] - w_old[index] - (x[N+1+index] - x[2*N+1+index])
-        })
+    problem = cp.Problem(cp.Maximize(utility), constraints)
+    problem.solve(solver=cp.OSQP, verbose=False)
 
-    #0<=wi<=1. i.e no short selling
-    bounds = [(0,1)]*(3*N+1)
+    if problem.status not in ["optimal", "optimal_inaccurate"]:
+        raise ValueError(f"Optimization failed with status: {problem.status}")
 
-    #our minimized portfolio
-    result = minimize(objective, init_guess, method="SLSQP", bounds=bounds, constraints=constraints)
-
-    if not result.success:
-        raise ValueError(f"Optimisation failed:  {result.message}")
-
-    #weights of risky assets
-    optimised_risky_weights = result.x[:N]
-    #weight of risk free asset
-    optimised_rf_weight = result.x[N]
-
-    return (optimised_risky_weights, optimised_rf_weight)
+    return w.value, w_rf.value
 
 
 # #start of efficient frontier plot
@@ -196,40 +181,39 @@ risk_free_rate=0.04
 
 def calc_help_sim(df):
     returns = df.pct_change().dropna()
-    trading_days = (len(returns)+1)
 
-    raw_annual_returns = returns.mean()*(trading_days)
+    raw_annual_returns = returns.mean()*252
     universe_mean = raw_annual_returns.mean()
 
     shrinkage_weight = 0.30
-    mean_returns = (shrinkage_weight*raw_annual_returns)+(1-shrinkage_weight)*universe_mean
+    mean_returns = (shrinkage_weight*raw_annual_returns) + ((1-shrinkage_weight)*universe_mean)
 
     lw=LedoitWolf()
-    cov_matrix = lw.fit(returns).covariance_*(trading_days)
+    cov_matrix = lw.fit(returns).covariance_*252
 
     return mean_returns, cov_matrix
 
 def simulate_year(risky, risk_free, rfr, data, start_c=1):
     daily_change = data.pct_change()
-    total_rf_gain = risk_free*rfr #total gains from capital allocated to risk free assets. not compounding.
-    daily_linear_rfr_gain = total_rf_gain/(len(data))
     change_vec = np.dot(daily_change, risky)
     change_vec = change_vec[~np.isnan(change_vec)]
-    accum = [sum(risky) * start_c] #percentage of starting capital allocated to risky assets (scales according to starting capital)
-    #calculate accumulated alpha daily
-    for c in change_vec:
-        next = accum[-1]*(1+c)
-        accum.append(next)
 
-    #adds risk free gains as linear change that unnafects daily changes through risky investments as in practice only get gains yearly when investment matures.
-    rf_accum = [risk_free*start_c] #scale rf weight according to starting capital
-    total_accum = accum.copy()
-    total_accum[0]+=risk_free
-    for i in range(len(change_vec)):
-        rf_accum.append(risk_free+daily_linear_rfr_gain*i)
-        total_accum[i+1]+=(risk_free+daily_linear_rfr_gain*i)
+    risky_capital = sum(risky)*start_c
+    rf_capital = risk_free*start_c
+
+    total_rf_gain = rf_capital*rfr
+    n_days = len(change_vec)
+    daily_linear_rfr_gain = total_rf_gain/ n_days
+
+    accum = [risky_capital] 
+    for c in change_vec:
+        accum.append(accum[-1]*(c+1))
+
+    rf_accum = [rf_capital + (daily_linear_rfr_gain*i) for i in range(n_days+1)] 
+
+    total_accum = [r + rf for r, rf in zip(accum, rf_accum)]
     
-    return change_vec, total_accum, accum, rf_accum
+    return data.index, total_accum, accum, rf_accum, change_vec
 
 #TODO: use previous and next dataframes of stock data to align the previous weight vector with that of the next years dataframe. i.e. add/remove items that now/no longer exist and reorder to match next.
 #Note: use fact that weight vector and df are already sorted for last year.
@@ -251,13 +235,13 @@ def transform_weights (last_weights, df_last : pd.DataFrame, df_new : pd.DataFra
             progress=False,
             auto_adjust=True
         )
-        new = df.get("Close", pd.DataFrame(index=df.index))
+        new = new.get("Close", pd.DataFrame(index=new.index))
         new = new.replace(['Nan', 'nan', 'None'], np.nan)
         new.dropna(axis=1, how='any', inplace=True)
         df_new_upd = df_new.join(new)
         df_new_upd.to_csv(f"{historical_data_path}{year}.csv")
-        return transform_weights(last_weights=last_weights, df_last=df_last, df_new=df_new_upd, year=year)
-    return new_weights.to_numpy()
+        return transform_weights(last_weights, df_last, df_new_upd, year)
+    return new_weights.to_numpy(), df_new
 
 #fetch data for stocks for which data exists for 2 years (from desired start). dont compare agaisnt what next years (SYP) holdings looks like as that garantees at least partial success of the asset     
 def fetch_data(year):
@@ -290,7 +274,9 @@ eps = 1e-7
 total = []
 risky = []
 risk_free = []
-years = 20
+returns = []
+dates = []
+years = 25
 
 spy = yf.download(tickers=["SPY"], 
             start=f"2001-01-01", 
@@ -308,12 +294,10 @@ for i in range(years):
     if i>0:
         df_last = fetch_data(year-1)
         #takes weights generated from last rebalance and fits it to a vector compatible with nexy years assets.
-        rw = transform_weights(rw, df_last, df, year)
-    print(f"\n {rw}")
-    print(len(rw))
+        rw, df = transform_weights(rw, df_last, df, year)
 
     #prep sample data
-    mu, sigma = calc_help_sim(df[:252]) #take first half of data 
+    mu, sigma = calc_help_sim(df.loc[f'{year}']) #take first half of data 
     
     if len(rw)==0:
         rw = [0]*len(df.columns)
@@ -322,7 +306,7 @@ for i in range(years):
     rfw_last = rfw
 
     #optimise
-    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=5.0)
+    rw, rfw = rf_minimise(mu, sigma, w_old=rw, rf=risk_free_rate, risk_aversion=6.0, max_weight=0.05)
 
     #clean
     rw[np.abs(rw)<eps] = 0 #modifies entries in place to zero if their value is less than 0.0000001
@@ -334,35 +318,73 @@ for i in range(years):
     except:
         start_c=1
     #remove costs from total capital
-    print(start_c)
     start_c -= change
-    print(start_c)
     #simulate for proceeding year
     #could compute return as one value, but I want to graph it.
-    change, accumulated, risky_only, rf_only = simulate_year(rw, rfw,risk_free_rate, df[252:], start_c) #use second half of dataset for simulation
+    date, accumulated, risky_only, rf_only, return_vec = simulate_year(rw, rfw,risk_free_rate, df.loc[f'{year+1}'], start_c) #use second half of dataset for simulation
     #extend vectors for graphing
+    dates.extend(date)
     total.extend(accumulated)
     risky.extend(risky_only)
+    returns.extend(return_vec)
     risk_free.extend(rf_only)
 
+def compute_sharpe(return_vec, trading_days = 252):
+    returns = np.asarray(return_vec)
+    daily_rf = risk_free_rate/trading_days
+
+    excess_returns = returns - daily_rf
+
+    mean_excess_returns = np.mean(excess_returns)
+    daily_std = np.std(excess_returns, ddof=1)
+
+    if daily_std == 0:
+        return 0.0
+
+    annualized_sharpe = (mean_excess_returns / daily_std) * np.sqrt(trading_days)
+
+    return annualized_sharpe
+
+def cagr(total_returns):
+    start = total_returns[0]
+    end = total_returns[-1]
+
+    cagr = ((end/start)**(1/years)-1)*100
+
+    return cagr
+    
+def max_d(accumulated_returns):
+    max_point = accumulated_returns[0]
+    max_diff = 1
+
+    for v in accumulated_returns:
+        if v > max_point:
+            max_point = v
+
+        elif v/max_point < max_diff:
+            max_diff = v/max_point
+
+    return (1-max_diff)
 
 spy_pct = spy.get("Close", pd.DataFrame(index=spy.index)).pct_change().to_numpy()
 spy_pct = spy_pct[~np.isnan(spy_pct)]
-spy_accum = [1]
-print(spy_pct)
+spy_accum = [0.95]
 
 for c in spy_pct:
-    next = spy_accum[-1]*(1+c)
-    spy_accum.append(next)
+    spy_accum.append(spy_accum[-1]*(1+c))
 
-print(f"risk free weight: {rfw}")
-print(f"risky weights: {rw}")
+s_r = compute_sharpe(returns)
+op_cagr = cagr(total)
+max_drawdown = max_d(total)
+print(f"Sharpe Ratio: {s_r}. \nCompound Annual Growth Rate: {round(op_cagr, 5)} %\nMax Drawdown: {round(max_drawdown*100, 5)} %")
+spy_s_r = compute_sharpe(spy_pct)
+print(f"SPY Sharpe ratio: {spy_s_r}")
 
 fig = plt.figure(figsize=(14,8))
-tot_line, =plt.plot(total, label="optimised portfolio returns")
-risk_line, =plt.plot(risky, label="risky assets returns")
-rf_line, =plt.plot(risk_free, label="risk free returns")
-spy_line, =plt.plot(spy_accum, label="SPY returns")
+tot_line, =plt.plot(dates, total, label="optimised portfolio returns")
+risk_line, =plt.plot(dates, risky, label="risky assets returns")
+rf_line, =plt.plot(dates, risk_free, label="risk free returns")
+spy_line, =plt.plot(dates, spy_accum, label="SPY returns")
 leg = plt.legend(bbox_to_anchor=(1.05,1), loc="upper left", borderaxespad=0.0, fancybox=True)
 
 lines = [tot_line, risk_line, rf_line, spy_line]
